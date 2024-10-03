@@ -812,16 +812,30 @@ def format_schema_error(
     return humanize_error(hass, exc, domain, config, link)
 
 
-async def async_process_ha_core_config(hass: HomeAssistant, config: dict) -> None:
-    """Process the [homeassistant] section from the configuration.
+async def async_process_ha_core_config(hass, config):
+    """Process the [homeassistant] section from the configuration."""
 
-    This method is a coroutine.
-    """
-    # CORE_CONFIG_SCHEMA is not async safe since it uses vol.IsDir
-    # so we need to run it in an executor job.
+    # CORE_CONFIG_SCHEMA is not async safe, run it in an executor job.
     config = await hass.async_add_executor_job(CORE_CONFIG_SCHEMA, config)
 
-    # Only load auth during startup.
+    await _initialize_auth(hass, config)
+
+    await hass.config.async_load()
+
+    await _process_core_settings(hass, config)
+
+    _setup_media_dirs(hass, config)
+
+    _setup_allowlists(hass, config)
+
+    _process_customization(hass, config)
+
+    if CONF_UNIT_SYSTEM in config:
+        hass.config.units = get_unit_system(config[CONF_UNIT_SYSTEM])
+
+
+async def _initialize_auth(hass: HomeAssistant, config: dict) -> None:
+    """Initialize auth if not already loaded."""
     if not hasattr(hass, "auth"):
         if (auth_conf := config.get(CONF_AUTH_PROVIDERS)) is None:
             auth_conf = [{"type": "homeassistant"}]
@@ -835,27 +849,12 @@ async def async_process_ha_core_config(hass: HomeAssistant, config: dict) -> Non
             hass, "auth", await auth.auth_manager_from_config(hass, auth_conf, mfa_conf)
         )
 
-    await hass.config.async_load()
 
+async def _process_core_settings(hass: HomeAssistant, config: dict) -> None:
+    """Process core settings like latitude, longitude, and time zone."""
     hac = hass.config
 
-    if any(
-        k in config
-        for k in (
-            CONF_LATITUDE,
-            CONF_LONGITUDE,
-            CONF_NAME,
-            CONF_ELEVATION,
-            CONF_TIME_ZONE,
-            CONF_UNIT_SYSTEM,
-            CONF_EXTERNAL_URL,
-            CONF_INTERNAL_URL,
-            CONF_CURRENCY,
-            CONF_COUNTRY,
-            CONF_LANGUAGE,
-            CONF_RADIUS,
-        )
-    ):
+    if _core_config_needs_yaml(config):
         hac.config_source = ConfigSource.YAML
 
     for key, attr in (
@@ -877,23 +876,52 @@ async def async_process_ha_core_config(hass: HomeAssistant, config: dict) -> Non
     if config.get(CONF_DEBUG):
         hac.debug = True
 
-    _raise_issue_if_historic_currency(hass, hass.config.currency)
-    _raise_issue_if_no_country(hass, hass.config.country)
+    _raise_issue_if_historic_currency(hass, hac.currency)
+    _raise_issue_if_no_country(hass, hac.country)
 
     if CONF_TIME_ZONE in config:
         await hac.async_set_time_zone(config[CONF_TIME_ZONE])
 
+
+def _core_config_needs_yaml(config: dict) -> bool:
+    """Check if core configuration values are present in YAML."""
+    return any(
+        key in config
+        for key in (
+            CONF_LATITUDE,
+            CONF_LONGITUDE,
+            CONF_NAME,
+            CONF_ELEVATION,
+            CONF_TIME_ZONE,
+            CONF_UNIT_SYSTEM,
+            CONF_EXTERNAL_URL,
+            CONF_INTERNAL_URL,
+            CONF_CURRENCY,
+            CONF_COUNTRY,
+            CONF_LANGUAGE,
+            CONF_RADIUS,
+        )
+    )
+
+
+def _setup_media_dirs(hass: HomeAssistant, config: dict) -> None:
+    """Set up media directories depending on the environment."""
+    hac = hass.config
     if CONF_MEDIA_DIRS not in config:
         if is_docker_env():
             hac.media_dirs = {"local": "/media"}
         else:
             hac.media_dirs = {"local": hass.config.path("media")}
 
-    # Init whitelist external dir
+
+def _setup_allowlists(hass: HomeAssistant, config: dict) -> None:
+    """Set up allowlist directories and URLs."""
+    hac = hass.config
+
+    # Initialize allowlist for external directories
     hac.allowlist_external_dirs = {hass.config.path("www"), *hac.media_dirs.values()}
     if CONF_ALLOWLIST_EXTERNAL_DIRS in config:
         hac.allowlist_external_dirs.update(set(config[CONF_ALLOWLIST_EXTERNAL_DIRS]))
-
     elif LEGACY_CONF_WHITELIST_EXTERNAL_DIRS in config:
         _LOGGER.warning(
             "Key %s has been replaced with %s. Please update your config",
@@ -904,15 +932,16 @@ async def async_process_ha_core_config(hass: HomeAssistant, config: dict) -> Non
             set(config[LEGACY_CONF_WHITELIST_EXTERNAL_DIRS])
         )
 
-    # Init whitelist external URL list – make sure to add / to every URL that doesn't
-    # already have it so that we can properly test "path ownership"
+    # Initialize allowlist for external URLs
     if CONF_ALLOWLIST_EXTERNAL_URLS in config:
         hac.allowlist_external_urls.update(
             url if url.endswith("/") else f"{url}/"
             for url in config[CONF_ALLOWLIST_EXTERNAL_URLS]
         )
 
-    # Customize
+
+def _process_customization(hass: HomeAssistant, config: dict) -> None:
+    """Process entity customization from the configuration."""
     cust_exact = dict(config[CONF_CUSTOMIZE])
     cust_domain = dict(config[CONF_CUSTOMIZE_DOMAIN])
     cust_glob = OrderedDict(config[CONF_CUSTOMIZE_GLOB])
@@ -932,9 +961,6 @@ async def async_process_ha_core_config(hass: HomeAssistant, config: dict) -> Non
         cust_glob.update(pkg_cust[CONF_CUSTOMIZE_GLOB])
 
     hass.data[DATA_CUSTOMIZE] = EntityValues(cust_exact, cust_domain, cust_glob)
-
-    if CONF_UNIT_SYSTEM in config:
-        hac.units = get_unit_system(config[CONF_UNIT_SYSTEM])
 
 
 def _log_pkg_error(
